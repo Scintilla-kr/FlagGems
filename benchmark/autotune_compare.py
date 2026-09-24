@@ -18,6 +18,9 @@
 --------
 - 无 AutoTune (OFF): 让 tuner 跳过真实搜索, 直接采用其(经 prune 的)候选列表中的
   第一个配置, 即算子作者给出的默认固定配置。未选中的候选不参与编译与运行。
+  对非 LibTuner 的原生 triton Autotuner(如 FlagGems 之外脚本用的 @triton.autotune),
+  额外把候选截断为第一个作为兜底: vendor fork 的 run 未必经由 self._bench 短路,
+  截断可在机制上保证 OFF 轮不发生真实搜索。
 - 有 AutoTune (ON): 恢复原生行为, 对每个 autotune key 完整搜索全部合法候选并择优。
   计时发生在 warmup 之后, 因此测得的是调优后的稳态性能。
 
@@ -113,6 +116,17 @@ def _wrap_tuner_run(orig_run):
         had_bench = "_bench" in self.__dict__
         saved_bench = self.__dict__.get("_bench")
         saved_cache = self.__dict__.get("cache")
+        # 兜底: vendor fork 的原生 Autotuner.run 未必经由 self._bench 短路,
+        # 对非 LibTuner 的原生 Autotuner 直接把候选截断为第一个(经 prune 后即
+        # 算子作者默认配置), 从机制上强制 OFF 轮跳过真实搜索
+        saved_configs = None
+        if (
+            _StockAutotuner is not None
+            and isinstance(self, _StockAutotuner)
+            and not isinstance(self, LibTuner)
+        ):
+            saved_configs = self.configs
+            self.configs = list(self.configs[:1])
         # OFF: 候选评估恒定返回同一耗时, tuner 由此选择(经 prune 的)第一个配置;
         # 评估函数被短路意味着未选中配置既不编译也不运行。
         self._bench = lambda *a, **k: 1.0
@@ -125,6 +139,8 @@ def _wrap_tuner_run(orig_run):
         try:
             return orig_run(self, *args, **kwargs)
         finally:
+            if saved_configs is not None:
+                self.configs = saved_configs
             if had_bench:
                 self._bench = saved_bench
             else:

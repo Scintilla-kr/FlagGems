@@ -119,7 +119,9 @@ configs = [
     for s in NUM_STAGES_OPTIONS \
     for w in [4, 8]\
 ]
-if "PYTEST_VERSION" in os.environ:
+# pytest 下默认折叠为单 config(加速正确性测试); 基准测试须设置
+# FUSED_ATTN_FULL_CONFIGS=1 保留完整候选空间, 否则 AutoTune 无候选可搜, OFF/ON 数据失真
+if "PYTEST_VERSION" in os.environ and os.environ.get("FUSED_ATTN_FULL_CONFIGS", "0") != "1":
     configs = [
         triton.Config(dict(BLOCK_M=128, BLOCK_N=64), num_stages=2, num_warps=4, pre_hook=_host_descriptor_pre_hook),
     ]
@@ -135,9 +137,13 @@ def keep(conf):
 def prune_invalid_configs(configs, named_args, **kwargs):
     N_CTX = kwargs["N_CTX"]
     STAGE = kwargs["STAGE"]
+    HEAD_DIM = kwargs["HEAD_DIM"]
+    # BLOCK_N <= HEAD_DIM 与 kernel 内 static_assert 一致: 提前剪掉必然编译失败的
+    # 候选, 避免 vendor autotuner 在 MLU/NPU 上因未捕获编译错误而中断调优
     return [
         conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
             conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
+        and conf.kwargs.get("BLOCK_N", 0) <= HEAD_DIM
     ]
 
 
@@ -149,7 +155,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "warp_specialize"],
+@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "warp_specialize", "STAGE"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
@@ -558,9 +564,9 @@ for HEAD_DIM in [64, 128]:
                     x_names=["N_CTX"],
                     x_vals=[2**i for i in range(10, 15)],  # 减少一点最大长度，防止显存溢出
                     line_arg="provider",
-                    line_vals=["triton-fp16"] + (["flash"] if HAS_FLASH else []),
-                    line_names=["Triton [FP16]"] + (["Flash-2"] if HAS_FLASH else []),
-                    styles=[("red", "-"), ("green", "-")],
+                    line_vals=["triton-fp16", "torch"] + (["flash"] if HAS_FLASH else []),
+                    line_names=["Triton [FP16]", "Torch SDPA"] + (["Flash-2"] if HAS_FLASH else []),
+                    styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                     ylabel="Time (ms)",
                     plot_name=
                     f"fused-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-{mode}-causal={causal}-warp_specialize=False",
@@ -581,11 +587,29 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
     dtype = torch.float16
     ms = 0.0
     if "triton" in provider:
+        # 固定种子: 保证 OFF/ON 两轮及重跑的输入一致, 结果才可对比、可复现
+        torch.manual_seed(2026)
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         sm_scale = 1.3
         fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn)
+
+    if provider == "torch":
+        # torch C++ 基线: scaled_dot_product_attention 在 MLU 上 dispatch 到 CNNL、
+        # NPU 上 dispatch 到厂商 fused attention 算子
+        # (若落到 math fallback 则为非融合的 matmul+softmax 路径, 对照时需注明)
+        torch.manual_seed(2026)
+        q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        fn = lambda: torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=causal, scale=1.3)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
