@@ -76,7 +76,10 @@ class FusedAttentionBenchmark(base.Benchmark):
             q = torch.randn((batch, h, n_ctx, head_dim), dtype=dtype, device=self.device)
             k = torch.randn((batch, h, n_ctx, head_dim), dtype=dtype, device=self.device)
             v = torch.randn((batch, h, n_ctx, head_dim), dtype=dtype, device=self.device)
-            yield q, k, v, causal, 1.3
+            # 标准 scale=1/sqrt(head_dim): torch_mlu 的 SDPA CNNL fused attention
+            # 后端不接受任意 scale(报 CNNL_STATUS_BAD_PARAM), 必须用标准值;
+            # 该值同时也是 SDPA 的默认 scale, 两侧算子公平可比
+            yield q, k, v, causal, head_dim ** -0.5
 
 
 @pytest.mark.fused_attention

@@ -592,7 +592,8 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-        sm_scale = 1.3
+        # 标准 scale=1/sqrt(head_dim), 与 torch SDPA 基线一致公平可比
+        sm_scale = HEAD_DIM ** -0.5
         fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
         if mode == "bwd":
             o = fn()
@@ -608,8 +609,10 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
         q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
         v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+        # 标准 scale=1/sqrt(head_dim): torch_mlu 的 SDPA CNNL 后端不接受任意
+        # scale(报 CNNL_STATUS_BAD_PARAM); 该值即 SDPA 默认 scale
         fn = lambda: torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=causal, scale=1.3)
+            q, k, v, is_causal=causal, scale=HEAD_DIM ** -0.5)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
