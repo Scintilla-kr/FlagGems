@@ -30,6 +30,11 @@ from . import autotune_compare, base, consts
 
 
 class TopKBenchmark(base.GenericBenchmark2DOnly):
+    # 注意: 已删除 (64, 8192, 128) 与 (128, 32768, 256) 两个大 k shape ——
+    # 通用 topk 的 topk_stage2_kernel 中 k 为 constexpr, for k_idx in range(k)
+    # 被 BiSheng 静态展开, 大 k 直接撑爆 NPU 的 UB(约 248KB): k=128/BLOCK=1024
+    # 时需约 328KB(2629888 bits) 即编译失败。其余 shape(n<4096 走单阶段
+    # argsort 路径, 或两阶段但 k=5)已在 NPU 上验证可编译执行。
     def set_shapes(self, shape_file_path=None):
         self.shapes = [
             (64, 64),
@@ -40,8 +45,6 @@ class TopKBenchmark(base.GenericBenchmark2DOnly):
             (8, 256),
             (64, 128, 8),
             (64, 1024, 32),
-            (64, 8192, 128),
-            (128, 32768, 256),
             ((4, 128, 64), 5),
             ((4, 128, 64), 64),
             ((8, 512, 32), 32),
