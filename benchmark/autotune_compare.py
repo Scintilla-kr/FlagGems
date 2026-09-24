@@ -42,20 +42,36 @@ import os
 import tempfile
 from contextlib import contextmanager
 
-from triton.runtime import Autotuner as _StockAutotuner
-
 import flag_gems
-from flag_gems.utils import libentry as _le
 
-_LibTuner = _le.LibTuner
-_LibEntry = _le.LibEntry
-_libcache = _le.libcache
+# 必须直接按模块路径导入: flag_gems.utils 包的 __init__ 里
+# `from .libentry import libentry, libtuner` 把装饰器“函数” libentry
+# 遮蔽了同名“子模块”, 写 `from flag_gems.utils import libentry` 拿到的是函数。
+from flag_gems.utils.libentry import LibCache, LibEntry, LibTuner, libcache
+
+_libcache = libcache
 _ORIG_DB_URL = _libcache.db_url
 
 # 进程内出现过的 tuner / LibEntry 实例(首次调用 run 时注册)
 _TUNERS = set()
 _LIB_ENTRIES = set()
 _state = {"off": False, "seen_off": set()}
+
+
+def _stock_autotuner_cls():
+    """从 LibTuner 的继承链解析原生 triton Autotuner, 而不直接 import triton.runtime。
+
+    部分 vendor 的 triton 分支(如 triton-ascend)在首次导入 triton.runtime 时
+    会连带加载后端 C 扩展(triton._C.libtriton.*), 在尚未初始化的进程里可能
+    ModuleNotFoundError; 走 flag_gems.libentry 已经成功加载过的路径最稳妥。
+    """
+    for cls in LibTuner.__mro__[1:]:
+        if cls.__name__ == "Autotuner" and cls.__module__.startswith("triton"):
+            return cls
+    return None
+
+
+_StockAutotuner = _stock_autotuner_cls()
 
 
 def _fresh_isolated_db_url():
@@ -69,7 +85,7 @@ def _swap_tuning_db(db_url):
     LibCache 是单例, 再次实例化会在原对象上重跑 __init__, 更换底层 SQL model
     与缓存池; libentry 模块内的 ``libcache`` 全局名指向同一对象, 无需重新赋值。
     """
-    _le.LibCache(db_url)
+    LibCache(db_url)
     for tuner in _TUNERS:
         table = getattr(tuner, "config_table_name", None)
         if table is not None:
@@ -130,11 +146,15 @@ def _wrap_libentry_run(orig_run):
 
 
 # 在 import 期打补丁: 同时覆盖 stock triton.autotune 与 FlagGems LibTuner
-# (LibTuner 定义了自己的 run, 需单独包装; 依据只覆写 policy 的子类不受影响)。
-_StockAutotuner.run = _wrap_tuner_run(_StockAutotuner.run)
-if _LibTuner.run is not _StockAutotuner.run:
-    _LibTuner.run = _wrap_tuner_run(_LibTuner.run)
-_LibEntry.run = _wrap_libentry_run(_LibEntry.run)
+# (LibTuner 定义了自己的 run, 需单独包装; 只覆写 policy 的子类不受影响)。
+# 若解析不到原生 Autotuner(理论上不会), 退化为只包装 LibTuner。
+if _StockAutotuner is not None:
+    _StockAutotuner.run = _wrap_tuner_run(_StockAutotuner.run)
+    if LibTuner.run is not _StockAutotuner.run:
+        LibTuner.run = _wrap_tuner_run(LibTuner.run)
+else:
+    LibTuner.run = _wrap_tuner_run(LibTuner.run)
+LibEntry.run = _wrap_libentry_run(LibEntry.run)
 
 
 @contextmanager
