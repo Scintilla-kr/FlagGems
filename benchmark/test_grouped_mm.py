@@ -20,7 +20,7 @@ import torch
 
 import flag_gems
 
-from . import base, utils
+from . import autotune_compare, base, utils
 
 
 class GroupmmBenchmark(base.BlasBenchmark):
@@ -50,8 +50,11 @@ def _input_fn(groups, N, K, cur_dtype, device):
     A_offs = 0
     B_offs = 0
     M_list = []
+    # 固定种子: 使 OFF/ON 两轮(以及重跑)生成完全一致的分组 M 序列,
+    # autotune key(M,N,K) 与工作负载才可对比、可复现
+    rng = random.Random(2026)
     for i in range(groups):
-        M_g = random.randint(1, 16384)
+        M_g = rng.randint(1, 16384)
         N_g = N
         K_g = K
         A_g = torch.rand([M_g, K_g], device=device, dtype=cur_dtype)
@@ -76,7 +79,7 @@ def _input_fn(groups, N, K, cur_dtype, device):
     utils.SkipVersion("torch", "<2.8"),
     reason="torch._grouped_mm requires PyTorch >= 2.8.0.",
 )
-def test_grouped_mm(monkeypatch):
+def test_grouped_mm():
     bench = GroupmmBenchmark(
         op_name="grouped_mm",
         input_fn=_input_fn,
@@ -85,4 +88,5 @@ def test_grouped_mm(monkeypatch):
         dtypes=[torch.bfloat16],
     )
 
-    bench.run()
+    # 依次执行 无AutoTune(默认配置)/有AutoTune(完整搜索) 两轮并输出对比
+    autotune_compare.run_autotune_comparison(bench)

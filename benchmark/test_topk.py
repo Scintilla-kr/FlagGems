@@ -17,7 +17,7 @@ import torch
 
 import flag_gems
 
-from . import base, consts
+from . import autotune_compare, base, consts
 
 
 class TopKBenchmark(base.GenericBenchmark2DOnly):
@@ -115,7 +115,8 @@ def test_topk():
     if flag_gems.vendor_name == "ascend":
         # DSA topk has no dim/largest args and is called directly (base.py
         # skips use_gems when gems_op is given); torch.topk(x, k) defaults to
-        # last-dim largest=True on both sides.
+        # last-dim largest=True on both sides. DSA 实现为固定配置, 无 Triton
+        # AutoTune, OFF/ON 两轮结果应基本一致(仅作对照)。
         bench = TopKAscendBenchmark(
             op_name="topk",
             input_fn=_ascend_input_fn,
@@ -131,4 +132,5 @@ def test_topk():
             dtypes=consts.FLOAT_DTYPES,
         )
 
-    bench.run()
+    # 依次执行 无AutoTune(默认配置)/有AutoTune(完整搜索) 两轮并输出对比
+    autotune_compare.run_autotune_comparison(bench)

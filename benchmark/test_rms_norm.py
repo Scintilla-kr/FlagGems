@@ -17,7 +17,7 @@ import torch
 
 import flag_gems
 
-from . import base
+from . import autotune_compare, base
 
 
 @pytest.mark.rms_norm
@@ -33,7 +33,8 @@ def test_rms_norm():
         input_fn=rms_norm_input_fn,
         torch_op=torch.nn.functional.rms_norm,
     )
-    bench.run()
+    # 依次执行 无AutoTune(默认配置)/有AutoTune(完整搜索) 两轮并输出对比
+    autotune_compare.run_autotune_comparison(bench)
 
 
 GROUP_SIZE = 128
@@ -108,4 +109,6 @@ def test_rms_norm_w8a16_int8():
         dtypes=[torch.bfloat16],
     )
     bench.set_gems(_gems_rms_norm_w8a16_int8)
-    bench.run()
+    # 依次执行 无AutoTune/有AutoTune 两轮并输出对比(Ascend 实现为固定配置,
+    # 两轮结果应基本一致, 仅作对照)
+    autotune_compare.run_autotune_comparison(bench)
