@@ -15,15 +15,18 @@
 import pytest
 import torch
 
+import flag_gems
+
 from . import autotune_compare, base, consts
 
-# 说明: 本脚本与 FlagGems_new 仓的 test_topk.py 保持一致(该版本在 NPU 上可
-# 正常执行)。其原理是: topk 在两个仓的 Ascend CUSTOMIZED_UNUSED_OPS 名单中,
-# Triton 版 topk 不会注册为 aten::topk 的 override, use_gems() 对 topk 空转,
-# 基线与 gems 两侧实际执行的都是 CANN 原生 torch.topk —— 因此 NPU 上
-# AutoTune OFF/ON 两轮结果必然一致(仅作对照, 不涉及 Triton kernel)。
-# FlagGems-1 的 _ascend DSA topk(经 SpecOpRegistrar 替换 flag_gems.topk 直接调用)
-# 在当前 NPU 上会触发 UB overflow, 故不在此路径中使用。
+# 说明: shapes 与 _input_fn 同 FlagGems_new 仓的 test_topk.py 保持一致。
+# NPU 上 topk 位于 _ascend 的 CUSTOMIZED_UNUSED_OPS 名单, Triton 版 topk
+# 不会注册为 aten::topk 的 override, use_gems() 对 topk 空转(会静默回退
+# CANN 原生实现); 而 flag_gems.topk 已被 SpecOpRegistrar 替换为 DSA topk
+# (当前 NPU 上触发 UB overflow)。因此 Ascend 分支显式传入通用 Triton topk
+# (flag_gems.ops.topk.topk) 作 gems_op, 保证 NPU 上真实执行 Triton kernel,
+# 与 CANN 原生 topk 形成真实对比。注意: 通用 topk 的 kernel 均为固定配置
+# (无 Triton autotune), AutoTune OFF/ON 两轮结果应一致(仅作对照)。
 
 
 class TopKBenchmark(base.GenericBenchmark2DOnly):
@@ -68,12 +71,23 @@ def _input_fn(shape, dtype, device):
 
 @pytest.mark.topk
 def test_topk():
-    bench = TopKBenchmark(
-        op_name="topk",
-        input_fn=_input_fn,
-        torch_op=torch.topk,
-        dtypes=consts.FLOAT_DTYPES,
-    )
+    if flag_gems.vendor_name == "ascend":
+        from flag_gems.ops.topk import topk as generic_topk
+
+        bench = TopKBenchmark(
+            op_name="topk",
+            input_fn=_input_fn,
+            torch_op=torch.topk,
+            gems_op=generic_topk,
+            dtypes=consts.FLOAT_DTYPES,
+        )
+    else:
+        bench = TopKBenchmark(
+            op_name="topk",
+            input_fn=_input_fn,
+            torch_op=torch.topk,
+            dtypes=consts.FLOAT_DTYPES,
+        )
 
     # 依次执行 无AutoTune(默认配置)/有AutoTune(完整搜索) 两轮并输出对比
     autotune_compare.run_autotune_comparison(bench)
