@@ -29,16 +29,22 @@ TRITON_THRESHOLD = 64  # max M for the single-tile fused path
 # Used for M <= 32 (and 33 <= M <= 64 in fp64); see the dispatch thresholds.
 # ===========================================================================
 
+# 注意: heuristics 字典必须提为模块级常量、装饰器行内不能出现 lambda。
+# Python 3.11.0 的 inspect.BlockFinder 不跟踪括号嵌套, 会把装饰器参数里
+# lambda 体的小括号 ")" 误判为"装饰器结束", 其后再出现 lambda 关键字就
+# 误置 islambda=True, 导致 getsource 只返回装饰器块、丢失 def 行,
+# triton jit.py 的 ^def 正则因此匹配到 None, NPU 上 import 即崩。
+# (CPython issue 46873; 3.12+/3.11 后续 patch 已修复, MLU 环境不受影响)
+_SINGLE_TILE_HEURISTICS = {
+    "num_warps": lambda args: (
+        4 if args["BLOCK"] <= 16 else 8 if args["BLOCK"] <= 32 else 8
+    ),  # 8 warps matches cuBLAS
+    "num_stages": lambda args: (2 if args["BLOCK"] <= 32 else 4),
+}
+
 
 @libentry()
-@triton.heuristics(
-    values={
-        "num_warps": lambda args: (
-            4 if args["BLOCK"] <= 16 else 8 if args["BLOCK"] <= 32 else 8
-        ),  # 8 warps matches cuBLAS
-        "num_stages": lambda args: (2 if args["BLOCK"] <= 32 else 4),
-    }
-)
+@triton.heuristics(values=_SINGLE_TILE_HEURISTICS)
 @triton.jit(do_not_specialize=["n"])
 def _single_tile_kernel(
     A_ptr,
