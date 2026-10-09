@@ -38,12 +38,22 @@
 - 若当前平台/算子没有多配置的 Triton kernel(如 Ascend DSA topk、固定 BLOCK_SIZE
   的 rms_norm), OFF/ON 两轮结果应基本一致, 输出中会打印对照说明。
 - 该对比应串行执行, 不要与 --parallel 组合。
+- NPU 上参考 benchmark/rmsnorm_situ_optim.py 的 profiling 方式, 在每轮计时后
+  追加一个 kernel 级 profiling pass(torch_npu profiler 采集, 解析落盘
+  op_summary/op_statistic CSV), 优先汇总 Triton kernel 时间(无 Triton 实现时
+  回退为全部 NPU kernel); 两轮的 kernel 级与端到端数据一并追加写入
+  benchmark/autotune_compare_performance.csv(每 case 一行, OFF/ON 并列)。
 """
 
+import csv
+import glob
 import math
 import os
 import tempfile
+import time
 from contextlib import contextmanager
+
+import torch
 
 import flag_gems
 
@@ -173,6 +183,347 @@ else:
 LibEntry.run = _wrap_libentry_run(LibEntry.run)
 
 
+# ---------------------------------------------------------------------------
+# kernel 级 profiling(参考 benchmark/rmsnorm_situ_optim.py 的 device_perf_npu):
+# torch_npu profiler 采集 + 解析落盘 CSV, 与框架的端到端计时互补。
+# 仅 NPU 可用; 其他平台跳过, 性能数据文件只记录端到端时延。
+# ---------------------------------------------------------------------------
+
+PERF_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "autotune_compare_performance.csv"
+)
+_PROFILING_ROOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "npu_profiling"
+)
+_PROF_WARMUP = 5
+_PROF_ACTIVE = 5
+
+_KERNEL_NAME_COLUMNS = ("Op Name", "Name", "Kernel Name")
+
+
+def _npu_profiling_supported():
+    if flag_gems.device != "npu":
+        return False
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _row_mentions_triton(row):
+    return "triton" in " ".join(str(value) for value in row.values()).lower()
+
+
+def _collect_kernel_name(row, names):
+    for column in _KERNEL_NAME_COLUMNS:
+        value = row.get(column)
+        if value:
+            names.add(str(value))
+            return
+
+
+def _join_names(names, limit=256):
+    text = "|".join(sorted(names))
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _collect_profile_rows(profiling_dir):
+    """解析 profiler 落盘 CSV, 返回 (行列表, 时长列名)。
+
+    与 rmsnorm_situ_optim.device_perf_npu 的两级解析一致: 优先
+    mindstudio_profiler_output/op_summary*.csv 的 "Task Duration(us)",
+    无则回退 op_statistic.csv 的 "Total Time(us)"。
+    """
+    for pattern, duration_column in (
+        (
+            os.path.join("**", "mindstudio_profiler_output", "op_summary*.csv"),
+            "Task Duration(us)",
+        ),
+        (os.path.join("**", "op_statistic.csv"), "Total Time(us)"),
+    ):
+        rows = []
+        for path in glob.glob(os.path.join(profiling_dir, pattern), recursive=True):
+            with open(path, newline="", encoding="utf-8-sig") as file:
+                reader = csv.DictReader(file)
+                if duration_column not in (reader.fieldnames or []):
+                    raise RuntimeError(
+                        f"{duration_column} is missing from {path}"
+                    )
+                rows.extend(reader)
+        if rows:
+            return rows, duration_column
+    return [], None
+
+
+def _device_perf_npu(executor, profiling_dir):
+    """torch_npu profiler 采集平均每迭代的 kernel 总时间(us)。
+
+    返回 (平均us, kernel名集合, 汇总范围)。汇总范围 "triton" 表示只统计
+    Triton kernel; 当前算子无 Triton 实现(如 DSA/原生库)时回退为全部
+    NPU kernel, 范围记为 "all"。
+    """
+    import torch_npu
+
+    os.makedirs(profiling_dir, exist_ok=True)
+
+    # 预热一次, 确保编译/建图发生在 profiler 窗口之外
+    executor()
+    torch.npu.synchronize()
+
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+        l2_cache=False,
+        data_simplification=False,
+    )
+    with torch_npu.profiler.profile(
+        activities=[torch_npu.profiler.ProfilerActivity.NPU],
+        schedule=torch_npu.profiler.schedule(
+            wait=0,
+            warmup=_PROF_WARMUP,
+            active=_PROF_ACTIVE,
+            repeat=1,
+            skip_first=0,
+        ),
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+            profiling_dir
+        ),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+        with_modules=False,
+        experimental_config=experimental_config,
+    ) as prof:
+        for _ in range(_PROF_WARMUP + _PROF_ACTIVE):
+            torch.npu.synchronize()
+            executor()
+            torch.npu.synchronize()
+            prof.step()
+
+    rows, duration_column = _collect_profile_rows(profiling_dir)
+    matched = [row for row in rows if _row_mentions_triton(row)]
+    scope = "triton"
+    if not matched:
+        # 非 Triton 实现(如 Ascend DSA/原生库): 回退为统计全部 NPU kernel
+        matched = rows
+        scope = "all"
+    if not matched:
+        raise RuntimeError(
+            f"profiler 未采集到任何 kernel 行: {profiling_dir}"
+        )
+    total_time_us = 0.0
+    names = set()
+    for row in matched:
+        duration = row.get(duration_column)
+        if duration:
+            total_time_us += float(duration)
+        _collect_kernel_name(row, names)
+    return total_time_us / _PROF_ACTIVE, names, scope
+
+
+def _make_case_executor(bench, args, kwargs):
+    """按 _measure_input/get_latency 的语义构造单个 case 的可执行体。
+
+    反向测试先在 dispatch 下建一次计算图, 之后反复 autograd.grad
+    (与 rmsnorm_situ_optim 反向测试的 executor 构造方式一致)。"""
+    op, dispatch, _ = bench._candidate_call()
+    if not bench.is_backward:
+        def executor():
+            with dispatch:
+                op(*args, **kwargs)
+
+        return executor
+
+    with dispatch:
+        out = op(*args, **kwargs)
+    dout = torch.randn_like(out)
+    xs = [a for a in args if torch.is_tensor(a) and a.requires_grad]
+
+    def executor():
+        torch.autograd.grad((out,), xs, grad_outputs=(dout,), retain_graph=True)
+
+    return executor
+
+
+def _make_profiling_dir(op, mode, dtype, idx):
+    run_id = f"{time.time_ns()}_{os.getpid()}"
+    dtype_label = str(dtype).removeprefix("torch.")
+    return os.path.join(
+        _PROFILING_ROOT, f"{op}_{mode}_{dtype_label}_case{idx}_{run_id}"
+    )
+
+
+def _profile_pass(bench, tag):
+    """对每个 case 采集 kernel 级平均耗时, 返回 record 列表。
+
+    record 含 (dtype, idx, avg_us, names, scope, dir, error); 单个 case 失败
+    不影响主流程, 错误信息记入 record 并回填到性能数据文件。"""
+    if not _npu_profiling_supported():
+        print(
+            f"[autotune-cmp] op={bench.op_name}: torch_npu profiler 不可用, "
+            f"跳过 kernel 级 profiling(性能数据文件仅记录端到端时延)"
+        )
+        return None
+    print(
+        f"[autotune-cmp] op={bench.op_name}: kernel 级 profiling pass "
+        f"(torch_npu profiler, warmup={_PROF_WARMUP}, active={_PROF_ACTIVE})"
+    )
+    records = []
+    for dtype in bench.to_bench_dtypes:
+        try:
+            input_iter = bench.get_input_iter(dtype)
+        except Exception as exc:
+            print(
+                f"[autotune-cmp] profile[{tag}] dtype={dtype} 无法枚举输入: {exc}"
+            )
+            continue
+        idx = 0
+        while True:
+            try:
+                inputs = next(input_iter)
+            except StopIteration:
+                break
+            except Exception as exc:
+                print(
+                    f"[autotune-cmp] profile[{tag}] dtype={dtype} case#{idx} "
+                    f"输入生成失败: {exc}"
+                )
+                break
+            record = {
+                "dtype": str(dtype),
+                "idx": idx,
+                "avg_us": None,
+                "names": "",
+                "scope": "",
+                "dir": "",
+                "error": "",
+            }
+            try:
+                args, kwargs = bench.unpack_to_args_kwargs(inputs)
+                executor = _make_case_executor(bench, args, kwargs)
+                profiling_dir = _make_profiling_dir(
+                    bench.op_name, tag, dtype, idx
+                )
+                avg_us, names, scope = _device_perf_npu(executor, profiling_dir)
+                record.update(
+                    avg_us=avg_us,
+                    names=names,
+                    scope=scope,
+                    dir=profiling_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 单 case 失败不影响主流程
+                record["error"] = str(exc)
+            records.append(record)
+            if record["avg_us"] is not None:
+                status = f"{record['avg_us']:.1f}us"
+            elif record["error"]:
+                status = f"失败({record['error']})"
+            else:
+                status = "跳过"
+            print(
+                f"[autotune-cmp] profile[{tag}] dtype={record['dtype']} "
+                f"case#{idx} kernel_time={status}"
+            )
+            idx += 1
+    return records
+
+
+def _fmt_us(value):
+    return "" if value is None else f"{value:.1f}"
+
+
+def _ratio(num, den):
+    if num is None or den is None or not den:
+        return ""
+    return f"{num / den:.3f}"
+
+
+def _flatten_results(results):
+    flat = []
+    for r in results or []:
+        for idx, m in enumerate(r.result):
+            flat.append((str(r.dtype), idx, m))
+    return flat
+
+
+def _index_profile(records):
+    if not records:
+        return {}
+    return {(r["dtype"], r["idx"]): r for r in records}
+
+
+def _append_perf_csv(op, vendor, off_results, on_results, off_prof, on_prof):
+    """把 OFF/ON 两轮的 kernel 级与端到端性能数据追加写入 CSV(每 case 一行)。"""
+    off_flat = _flatten_results(off_results)
+    on_flat = _flatten_results(on_results)
+    if not off_flat or not on_flat:
+        print(f"[autotune-cmp] op={op}: 无可写入性能数据文件的结果, 跳过")
+        return
+    prof_off = _index_profile(off_prof)
+    prof_on = _index_profile(on_prof)
+    fieldnames = [
+        "op",
+        "vendor",
+        "dtype",
+        "case",
+        "shape_detail",
+        "kernel_time_off_us",
+        "kernel_time_on_us",
+        "kernel_gain",
+        "e2e_off_ms",
+        "e2e_on_ms",
+        "e2e_gain",
+        "kernel_scope",
+        "kernel_names",
+        "profiling_dir_off",
+        "profiling_dir_on",
+        "timestamp",
+    ]
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for (dtype, idx, m_off), (_, _, m_on) in zip(off_flat, on_flat):
+        key = (dtype, idx)
+        p_off = prof_off.get(key, {})
+        p_on = prof_on.get(key, {})
+        k_off = p_off.get("avg_us")
+        k_on = p_on.get("avg_us")
+        names = p_on.get("names") or p_off.get("names")
+        error = p_off.get("error") or p_on.get("error")
+        rows.append(
+            {
+                "op": op,
+                "vendor": vendor,
+                "dtype": dtype,
+                "case": idx,
+                "shape_detail": "" if m_off.shape_detail is None else str(m_off.shape_detail),
+                "kernel_time_off_us": _fmt_us(k_off),
+                "kernel_time_on_us": _fmt_us(k_on),
+                "kernel_gain": _ratio(k_off, k_on),
+                "e2e_off_ms": _fmt_ms(m_off.latency),
+                "e2e_on_ms": _fmt_ms(m_on.latency),
+                "e2e_gain": _ratio(m_off.latency, m_on.latency),
+                "kernel_scope": p_on.get("scope") or p_off.get("scope") or "",
+                "kernel_names": _join_names(names) if names else error,
+                "profiling_dir_off": p_off.get("dir", ""),
+                "profiling_dir_on": p_on.get("dir", ""),
+                "timestamp": timestamp,
+            }
+        )
+    needs_header = not os.path.exists(PERF_CSV_PATH) or os.path.getsize(
+        PERF_CSV_PATH
+    ) == 0
+    with open(PERF_CSV_PATH, "a", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        if needs_header:
+            writer.writeheader()
+        writer.writerows(rows)
+    print(
+        f"[autotune-cmp] op={op}: 已追加 {len(rows)} 行性能数据到 {PERF_CSV_PATH}"
+    )
+
+
 @contextmanager
 def _autotune_disabled():
     prev_print = os.environ.get("TRITON_PRINT_AUTOTUNING")
@@ -266,6 +617,10 @@ def _report(op, off_results, on_results):
 def run_autotune_comparison(bench):
     """对给定 benchmark 依次执行 无AutoTune/有AutoTune 两轮压测并输出对比。
 
+    每轮计时结束后, 在相同的 AutoTune 状态下(OFF 轮仍在禁用上下文内)追加
+    一个 kernel 级 profiling pass; 两轮数据最终追加写入性能数据文件
+    (PERF_CSV_PATH, 每 case 一行)。
+
     Returns:
         (off_results, on_results): 两轮 ``bench.run()`` 返回的 BenchmarkResult 列表。
     """
@@ -276,6 +631,7 @@ def run_autotune_comparison(bench):
         f"OFF=默认固定配置(不搜索), ON=完整 AutoTune 搜索"
     )
     off_results, on_results = None, None
+    off_prof, on_prof = None, None
     try:
         # 隔离真实调优库: 防止历史 tuned 配置让 OFF 轮直接“免费”吃到调优结果;
         # 同时清掉本会话先前测试在 launch 层留下的同参数缓存
@@ -284,13 +640,19 @@ def run_autotune_comparison(bench):
         print(f"===== [{op}] Pass 1/2: AutoTune OFF (默认固定配置) =====")
         with _autotune_disabled():
             off_results = _run_pass(bench, "AutoTune_OFF")
+            # 计时轮已让 launch 缓存持有 OFF 默认配置的 kernel,
+            # 在同一禁用状态下采集 kernel 级耗时, 口径与计时轮一致
+            off_prof = _profile_pass(bench, "AutoTune_OFF")
         # 清 launch 层缓存 + 换全新隔离库, 确保第二轮真正重新调优
         _clear_launch_caches()
         _swap_tuning_db(_fresh_isolated_db_url())
         print(f"===== [{op}] Pass 2/2: AutoTune ON (完整配置搜索) =====")
         with _tuning_evidence():
             on_results = _run_pass(bench, "AutoTune_ON")
+            # 调优后的稳态 kernel 级耗时
+            on_prof = _profile_pass(bench, "AutoTune_ON")
     finally:
         _swap_tuning_db(_ORIG_DB_URL)
     _report(op, off_results, on_results)
+    _append_perf_csv(op, vendor, off_results, on_results, off_prof, on_prof)
     return off_results, on_results

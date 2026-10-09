@@ -35,6 +35,7 @@ import os
 import pytest
 import torch
 
+import flag_gems
 from . import autotune_compare, base
 
 # 06 文件名以数字开头, 无法常规 import; 环境开关必须在 exec 前设置
@@ -45,6 +46,16 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 _fused_attn = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_fused_attn)
+
+if flag_gems.vendor_name == "cambricon":
+    # MLU 后端 num_warps>4 会 fallback 到 4(编译器警告), 即 warps=8 候选仍走
+    # 全量编译(实测单 config ~55s)却产出与 warps=4 相同的 kernel, 属纯浪费;
+    # 剪掉后搜索空间减半, 调优结果不受影响。
+    # 注意: MLU 上单 config 编译耗时约 1 分钟, ON 轮全量搜索预计 2~3 小时,
+    # 属正常现象(非卡死), 建议后台执行。
+    _fused_attn._attn_fwd.configs = [
+        c for c in _fused_attn._attn_fwd.configs if c.num_warps <= 4
+    ]
 
 
 # warp_specialize=False: 非 CUDA 后端不支持 warp specialize(与 06 脚本 bench 一致)
