@@ -326,23 +326,32 @@ def _device_perf_npu(executor, profiling_dir):
 def _make_case_executor(bench, args, kwargs):
     """按 _measure_input/get_latency 的语义构造单个 case 的可执行体。
 
+    use_gems 是一次性上下文管理器(__exit__ 会 del 掉自身属性), 同一实例
+    不能二次进入: 每次调用都通过 _candidate_call() 新建 dispatch 再进入,
+    与框架 _measure_input 每次测量重建 dispatch 的语义一致。
     反向测试先在 dispatch 下建一次计算图, 之后反复 autograd.grad
-    (与 rmsnorm_situ_optim 反向测试的 executor 构造方式一致)。"""
-    op, dispatch, _ = bench._candidate_call()
+    (autograd.grad 也需在 dispatch 窗口内, 反向 aten 算子才会路由到 gems)。"""
     if not bench.is_backward:
+
         def executor():
+            op, dispatch, _ = bench._candidate_call()
             with dispatch:
                 op(*args, **kwargs)
 
         return executor
 
+    op, dispatch, _ = bench._candidate_call()
     with dispatch:
         out = op(*args, **kwargs)
     dout = torch.randn_like(out)
     xs = [a for a in args if torch.is_tensor(a) and a.requires_grad]
 
     def executor():
-        torch.autograd.grad((out,), xs, grad_outputs=(dout,), retain_graph=True)
+        _, dispatch, _ = bench._candidate_call()
+        with dispatch:
+            torch.autograd.grad(
+                (out,), xs, grad_outputs=(dout,), retain_graph=True
+            )
 
     return executor
 
