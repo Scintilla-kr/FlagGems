@@ -28,7 +28,7 @@ except ImportError:
     pass
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as tle
 from flag_gems.utils.limits import get_dtype_max, get_dtype_min
 from flag_gems.utils.triton_version_utils import HAS_TLE
@@ -37,6 +37,23 @@ if HAS_TLE:
     import triton.experimental.tle.language as tle_gpu
 else:
     tle_gpu = None
+
+
+def cfggen_topk_nw_ns():
+    # 三个 topk kernel 的 BLOCK 维度均为正确性/分配耦合约束不可调:
+    # - single_stage/stage2: BLOCK_SIZE = next_pow2(N) 单 shot, 已是最小合法值
+    # - stage1: CHUNK_SIZE 决定 stage1_out 分配形状, 不能进 Config
+    # 故只调 num_warps/num_stages(空 kwargs Config, 调用点仍显式传 BLOCK 参数)。
+    # 第一个 config = stock 隐式默认, 保证各后端 OFF 轮(取首候选)与现网一致;
+    # 其余候选覆盖 MLU(nw=1)/NPU(nw 2/4/8) 平台惯例。
+    return [
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=1),
+    ]
 
 logger = logging.getLogger(__name__)
 _MIN_FLOAT32_VAL = tl.constexpr(torch.finfo(torch.float32).min)
@@ -88,6 +105,7 @@ def _get_iinfo_val(
         return get_dtype_min(dtype)
 
 
+@libtuner(configs=cfggen_topk_nw_ns(), key=["N", "k"], warmup=5, rep=10)
 @libentry()
 @triton.jit
 def topk_single_stage_kernel(
@@ -122,6 +140,7 @@ def topk_single_stage_kernel(
     tl.store(index_ptr + cols, sorted_idx.to(tl.int64), mask=out_mask)
 
 
+@libtuner(configs=cfggen_topk_nw_ns(), key=["N", "k"], warmup=5, rep=10)
 @libentry()
 @triton.jit
 def topk_stage1_kernel(
@@ -283,6 +302,7 @@ def argsort(x, ids, dim: tl.constexpr, descending: core.constexpr):
     return x, ids
 
 
+@libtuner(configs=cfggen_topk_nw_ns(), key=["N", "k"], warmup=5, rep=10)
 @libentry()
 @triton.jit
 def topk_stage2_kernel(

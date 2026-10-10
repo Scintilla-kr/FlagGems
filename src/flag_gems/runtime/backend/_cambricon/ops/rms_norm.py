@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import libentry, libtuner
 
 from ..utils import MAX_GRID_SIZE_X
 
@@ -33,6 +33,21 @@ def cfggen_rms_norm_c_split():
         triton.Config({"BLOCK_SIZE": block_size}, num_warps=1, num_stages=num_stages)
         for block_size in [1024, 2048, 4096, 8192, 16384]
         for num_stages in [1, 3]
+    ]
+
+
+def cfggen_rms_norm_mlu():
+    # 单 shot kernel 的 BLOCK_SIZE >= N 是正确性硬约束, 不可调;
+    # 只调 num_warps/num_stages(空 kwargs Config, 调用点仍显式传 BLOCK_SIZE)。
+    # 第一个 config 须等于后端隐式默认(按 stock 假设 nw=4/ns=3,
+    # 若实测不符需回填, 否则 OFF 轮基线会漂移);
+    # 其余候选遵循本仓 MLU 惯例(绝大多数 kernel nw=1, ns∈{1,3})。
+    return [
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=1, num_stages=1),
+        triton.Config({}, num_warps=1, num_stages=3),
+        triton.Config({}, num_warps=2, num_stages=1),
+        triton.Config({}, num_warps=2, num_stages=3),
     ]
 
 
@@ -122,6 +137,7 @@ def rms_norm_backward(dy, x, inv_rms, normalized_shape, weight, eps=1e-5):
     return dx, dw
 
 
+@libtuner(configs=cfggen_rms_norm_mlu(), key=["N"], warmup=5, rep=10)
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_kernel(
@@ -212,6 +228,7 @@ def rms_norm_kernel_C_split(
         pid += prog_num
 
 
+@libtuner(configs=cfggen_rms_norm_mlu(), key=["N"], warmup=5, rep=10)
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_grad_dx_kernel(

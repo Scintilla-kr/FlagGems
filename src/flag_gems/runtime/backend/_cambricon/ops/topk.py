@@ -384,6 +384,45 @@ if HAS_TLE:
         mask = tl.where((x & tm) != 0, tm, fm)
         return x ^ mask
 
+    def cfggen_topk_radix_tle():
+        # RADIX_BITS=4 / num_stages=1 与当前显式启动一致, 不调;
+        # 实际候选列表由 early_config_prune 按 n_cols/K_PAD 重建
+        # (第一个 = 当前默认公式值, 其余按 BLOCK_N >= K_PAD 过滤)
+        return [
+            triton.Config({"BLOCK_N": 256, "RADIX_BITS": 4}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_N": 512, "RADIX_BITS": 4}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_N": 1024, "RADIX_BITS": 4}, num_warps=4, num_stages=1),
+            triton.Config({"BLOCK_N": 512, "RADIX_BITS": 4}, num_warps=8, num_stages=1),
+            triton.Config({"BLOCK_N": 1024, "RADIX_BITS": 4}, num_warps=8, num_stages=1),
+        ]
+
+    def topk_radix_tle_config_prune(configs, named_args, **kwargs):
+        n_cols = named_args["n_cols"]  # 位置参数 -> named_args
+        k_pad = kwargs.get("K_PAD", named_args.get("K_PAD"))  # 关键字参数 -> kwargs
+        # 精确复现原默认公式(见 topk() 分派处的注释)
+        default_bn = min(max(k_pad, min(512, triton.next_power_of_2(n_cols))), 1024)
+        head = triton.Config(
+            {"BLOCK_N": default_bn, "RADIX_BITS": 4}, num_warps=4, num_stages=1
+        )
+        new_configs, seen = [], set()
+        for cfg in [head] + list(configs):
+            bn = cfg.kwargs["BLOCK_N"]
+            if bn < k_pad:  # BLOCK_N >= k_pad 合法性约束
+                continue
+            dedup = (bn, cfg.num_warps)
+            if dedup in seen:
+                continue
+            seen.add(dedup)
+            new_configs.append(cfg)
+        return new_configs
+
+    @libtuner(
+        configs=cfggen_topk_radix_tle(),
+        key=["n_cols", "K"],
+        prune_configs_by={"early_config_prune": topk_radix_tle_config_prune},
+        warmup=5,
+        rep=10,
+    )
     @libentry()
     @triton.jit
     def topk_kernel_radix_tle(
@@ -591,8 +630,9 @@ def topk(x, k, dim=-1, largest=True, sorted=True):
         out_shape = x.shape[:-1] + (k,)
         y_vals = torch.empty(out_shape, device=x.device, dtype=x.dtype)
         y_idx = torch.empty(out_shape, device=x.device, dtype=torch.int64)
-        block_n_radix = max(k_pad, min(512, triton.next_power_of_2(topk_elem_cnt)))
-        block_n_radix = min(block_n_radix, 1024)
+        # BLOCK_N/RADIX_BITS/num_warps/num_stages 由 libtuner 注入:
+        # early_config_prune 第一个候选恒为原默认公式
+        # min(max(k_pad, min(512, next_power_of_2(n))), 1024) + nw=4/ns=1
 
         x_2d = x.reshape(batch_size, topk_elem_cnt)
         y_vals_2d = y_vals.reshape(batch_size, k)
@@ -607,10 +647,6 @@ def topk(x, k, dim=-1, largest=True, sorted=True):
                 topk_elem_cnt,
                 K=k,
                 K_PAD=k_pad,
-                BLOCK_N=block_n_radix,
-                RADIX_BITS=4,
-                num_warps=4,
-                num_stages=1,
             )
         return (y_vals, y_idx)
 

@@ -20,12 +20,56 @@ import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import libentry
+from flag_gems.utils import libentry, libtuner
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
+# kernel 体循环 over N, BLOCK_SIZE 可自由调小;
+# 上限 12064(fwd)/6912(bwd) 是现网已验证的 UB 安全界, 候选绝不超过
+_ASCEND_RMS_BLOCK_CANDIDATES = [8192, 4096, 2048, 1024]
+_ASCEND_RMS_NW = 4  # 验证后端隐式默认后回填, 暂按 stock (4, 3) 假设
+_ASCEND_RMS_NS = 3
 
+
+def cfggen_ascend_rms_norm():
+    # 静态占位列表(必须 >= 2 个, LibTuner.run 用 len(self.configs) > 1
+    # 判断是否进搜索); 实际候选由 early_config_prune 按 N 重建,
+    # 第一个恒为当前默认公式值, 保证 OFF 轮(取首候选)复现现网行为
+    return [
+        triton.Config(
+            {"BLOCK_SIZE": bs}, num_warps=_ASCEND_RMS_NW, num_stages=_ASCEND_RMS_NS
+        )
+        for bs in [12064, 8192, 4096, 2048, 1024]
+    ]
+
+
+def make_rms_norm_config_prune(cap):
+    def prune(configs, named_args, **kwargs):
+        N = named_args["N"]
+        default_bs = min(triton.next_power_of_2(N), cap)
+
+        def mk(bs):
+            return triton.Config(
+                {"BLOCK_SIZE": bs}, num_warps=_ASCEND_RMS_NW, num_stages=_ASCEND_RMS_NS
+            )
+
+        new_configs = [mk(default_bs)]  # 第一个 = 当前默认
+        for bs in _ASCEND_RMS_BLOCK_CANDIDATES:
+            if bs < default_bs:  # 只追加更小者: 大 N 不退化, UB 绝对安全
+                new_configs.append(mk(bs))
+        return new_configs
+
+    return prune
+
+
+@libtuner(
+    configs=cfggen_ascend_rms_norm(),
+    key=["N"],
+    prune_configs_by={"early_config_prune": make_rms_norm_config_prune(12064)},
+    warmup=5,
+    rep=10,
+)
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_kernel(
@@ -65,6 +109,13 @@ def rms_norm_kernel(
     tl.store(INV_RMS + pid, rrms)
 
 
+@libtuner(
+    configs=cfggen_ascend_rms_norm(),
+    key=["N"],
+    prune_configs_by={"early_config_prune": make_rms_norm_config_prune(6912)},
+    warmup=5,
+    rep=10,
+)
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def rms_norm_grad_dx_kernel(
@@ -176,7 +227,8 @@ class RmsNorm(torch.autograd.Function):
         M = math.prod(x.shape[:dim])
         N = math.prod(normalized_shape)
 
-        BLOCK_SIZE = min(triton.next_power_of_2(N), 12064)
+        # BLOCK_SIZE 由 libtuner 的 early_config_prune 按 N 重建候选
+        # (第一个 = min(next_power_of_2(N), 12064), 即原默认公式)
 
         x = x.contiguous()
         weight = weight.contiguous()
@@ -184,7 +236,7 @@ class RmsNorm(torch.autograd.Function):
         inv_rms = torch.empty((M,), device=x.device, dtype=torch.float32)
 
         with torch_device_fn.device(x.device):
-            rms_norm_kernel[M,](y, inv_rms, x, weight, N, 1, N, 1, N, eps, BLOCK_SIZE)
+            rms_norm_kernel[M,](y, inv_rms, x, weight, N, 1, N, 1, N, eps)
 
         ctx.save_for_backward(x, inv_rms, weight)
         ctx.normalized_shape = normalized_shape
@@ -202,14 +254,15 @@ class RmsNorm(torch.autograd.Function):
         M = math.prod(x.shape[:dim])
         N = math.prod(normalized_shape)
 
-        BLOCK_SIZE = min(triton.next_power_of_2(N), 6912)
+        # BLOCK_SIZE 由 libtuner 的 early_config_prune 按 N 重建候选
+        # (第一个 = min(next_power_of_2(N), 6912), 即原默认公式)
         x = x.contiguous()
         weight = weight.contiguous()
         dx = torch.empty_like(x)
 
         with torch_device_fn.device(x.device):
             rms_norm_grad_dx_kernel[M,](
-                x, dy, inv_rms, dx, weight, N, 1, N, 1, N, eps, BLOCK_SIZE
+                x, dy, inv_rms, dx, weight, N, 1, N, 1, N, eps
             )
 
         ROW_BLOCK_SIZE = 16
